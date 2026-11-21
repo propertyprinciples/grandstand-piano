@@ -30,15 +30,28 @@ function finishGate(inst) {
   gate[inst].resolve()
 }
 
-const fetched = Promise.all(Object.entries(LIBRARY).flatMap(([inst, notes]) => notes.map(async (note) => {
-  try {
-    const response = await fetch(`samples/${inst}/${note}.mp3`)
-    if (!response.ok) throw new Error(String(response.status))
-    return { inst, note, buf: await response.arrayBuffer() }
-  } catch {
-    return null
+function loadRecordings() {
+  const jobs = []
+  for (const [inst, notes] of Object.entries(LIBRARY)) {
+    for (const note of notes) jobs.push({ inst, note })
   }
-})))
+  const results = []
+  let cursor = 0
+  async function worker() {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor]
+      cursor += 1
+      try {
+        const response = await fetch(`samples/${job.inst}/${job.note}.mp3`)
+        if (!response.ok) continue
+        results.push({ inst: job.inst, note: job.note, buf: await response.arrayBuffer() })
+      } catch { /* a missing file falls back to the nearest note */ }
+    }
+  }
+  return Promise.all([worker(), worker(), worker(), worker()]).then(() => results)
+}
+
+const fetched = loadRecordings()
 
 export function noteFreq(note) {
   const midi = midiOf(note)
@@ -69,6 +82,8 @@ export function createEngine() {
   let volume = 0.75
   let keysReady = false
   let decodePromise = null
+  let primed = false
+  let unlocked = false
 
   const hooks = {
     getBpm: () => 110,
@@ -80,6 +95,7 @@ export function createEngine() {
     onHalted: () => {},
     onBeat: () => {},
     onKeysReady: () => {},
+    onUnlock: () => {},
   }
 
   function setHooks(next) {
@@ -90,15 +106,13 @@ export function createEngine() {
   function ensure() {
     if (ctx) return
     const AudioCtx = window.AudioContext || window.webkitAudioContext
-    ctx = new AudioCtx({ latencyHint: "interactive" })
+    try {
+      ctx = new AudioCtx()
+    } catch {
+      ctx = new AudioCtx()
+    }
     master = ctx.createGain()
     master.gain.value = volume
-    const comp = ctx.createDynamicsCompressor()
-    comp.threshold.value = -12
-    comp.knee.value = 8
-    comp.ratio.value = 2.2
-    comp.attack.value = 0.008
-    comp.release.value = 0.18
     melodyBus = ctx.createGain()
     rhythmBus = ctx.createGain()
     sfxBus = ctx.createGain()
@@ -108,29 +122,67 @@ export function createEngine() {
     melodyBus.connect(master)
     rhythmBus.connect(master)
     sfxBus.connect(master)
+    // iPhone Safari silences the whole graph when a compressor is in it.
+    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    if (ios) {
+      master.connect(ctx.destination)
+      return
+    }
+    const comp = ctx.createDynamicsCompressor()
+    comp.threshold.value = -12
+    comp.knee.value = 8
+    comp.ratio.value = 2.2
+    comp.attack.value = 0.008
+    comp.release.value = 0.18
     master.connect(comp)
     comp.connect(ctx.destination)
   }
 
   function markKeysReady() {
-    if (keysReady || !gate.piano.done || !gate.guitar.done) return
+    if (keysReady || !gate.piano.done) return
     keysReady = true
     hooks.onKeysReady()
+  }
+
+  function decodeBuffer(buf) {
+    const copy = buf.slice(0)
+    return new Promise((resolve, reject) => {
+      ctx.decodeAudioData(copy, resolve, reject)
+    })
+  }
+
+  async function decodeNote(inst, note) {
+    if (cache[inst]?.[note]) return
+    const items = await fetched
+    const item = items.find((entry) => entry.inst === inst && entry.note === note)
+    if (!item?.buf || !ctx) return
+    try {
+      cache[inst][note] = await decodeBuffer(item.buf)
+      item.buf = null
+    } catch { /* the nearest decoded note covers a bad file */ }
   }
 
   function decodeAll() {
     if (decodePromise) return decodePromise
     ensure()
     decodePromise = (async () => {
+      if (ctx.state !== "running") {
+        try { await ctx.resume() } catch { /* the tap already asked it to run */ }
+      }
       const items = await fetched
       const order = ["piano", "guitar", "trumpet", "flute", "saxophone", "drums"]
       for (const inst of order) {
-        await Promise.all(items.filter((item) => item && item.inst === inst).map(async (item) => {
-          if (cache[inst][item.note]) return
-          try {
-            cache[inst][item.note] = await ctx.decodeAudioData(item.buf.slice(0))
-          } catch { /* skip a bad file; the nearest note covers it */ }
-        }))
+        const notes = items.filter((item) => item.inst === inst)
+        for (let i = 0; i < notes.length; i += 2) {
+          await Promise.all(notes.slice(i, i + 2).map(async (item) => {
+            if (!item.buf || cache[inst][item.note]) return
+            try {
+              cache[inst][item.note] = await decodeBuffer(item.buf)
+              item.buf = null
+            } catch { /* skip a bad file; the nearest note covers it */ }
+          }))
+        }
         finishGate(inst)
         markKeysReady()
       }
@@ -143,8 +195,23 @@ export function createEngine() {
 
   function unlock() {
     ensure()
-    if (ctx.state !== "running") ctx.resume()
+    if (ctx.state !== "running") {
+      const pending = ctx.resume()
+      if (pending && pending.catch) pending.catch(() => {})
+    }
+    if (!primed) {
+      primed = true
+      const buffer = ctx.createBuffer(1, 1, ctx.sampleRate)
+      const blip = ctx.createBufferSource()
+      blip.buffer = buffer
+      blip.connect(master)
+      try { blip.start() } catch { /* already running */ }
+    }
     decodeAll()
+    if (!unlocked) {
+      unlocked = true
+      try { hooks.onUnlock() } catch { /* the status line can update later */ }
+    }
   }
 
   function whenReady(inst) {
@@ -213,7 +280,11 @@ export function createEngine() {
     }
     src.connect(gain)
     gain.connect(busOf(busName))
-    src.start(time, offset)
+    try {
+      src.start(time, offset)
+    } catch {
+      try { src.start() } catch { return null }
+    }
     src.onended = () => {
       live.delete(src)
       live.delete(gain)
@@ -584,11 +655,15 @@ export function createEngine() {
     let released = false
     let handle = null
     const begin = () => {
-      if (released) return
+      if (!nearest(id, note)) return
+      if (released) {
+        playSample(id, note, ctx.currentTime, id === "guitar" ? 0.7 : 0.4, "keys")
+        return
+      }
       handle = holdSample(id, note, "keys")
     }
     if (nearest(id, note)) begin()
-    else whenReady(id).then(begin)
+    else decodeNote(id, note).then(begin)
     return () => {
       released = true
       handle?.release()
@@ -602,8 +677,6 @@ export function createEngine() {
     killBus("sfx")
     hooks.onHalted()
   }
-
-  decodeAll()
 
   return {
     setHooks,

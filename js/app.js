@@ -40,6 +40,7 @@ const state = {
   playing: false,
   activeId: null,
   samplesReady: false,
+  waking: false,
 }
 
 const presses = { pennant: 0, ball: 0, charge: 0 }
@@ -85,6 +86,10 @@ audio.setHooks({
   },
   onKeysReady: () => {
     state.samplesReady = true
+    paintStatus()
+  },
+  onUnlock: () => {
+    state.waking = true
     paintStatus()
   },
 })
@@ -382,7 +387,7 @@ function paintDeck() {
 
 function paintStatus() {
   const active = PAGES.find((page) => page.id === state.activeId)
-  if (!state.samplesReady && !state.playing) {
+  if (state.waking && !state.samplesReady && !state.playing) {
     nowEl.textContent = "Loading the keyboard…"
     return
   }
@@ -542,6 +547,10 @@ function releaseKey(pointerId) {
 }
 
 const KEYMAP = Object.fromEntries(KEYS.map((key) => [key.computer.toLowerCase(), key.note]))
+
+for (const type of ["touchstart", "touchend", "pointerdown"]) {
+  window.addEventListener(type, () => audio.unlock(), { capture: true, passive: true })
+}
 
 deck.addEventListener("pointerdown", () => {
   audio.unlock()
