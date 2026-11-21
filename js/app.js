@@ -1,4 +1,4 @@
-import { createEngine } from "./audio.js?v=6"
+import { createEngine } from "./audio.js?v=7"
 import {
   EFFECTS,
   INSTRUMENTS,
@@ -591,16 +591,62 @@ volumeInput.addEventListener("input", () => {
   setVolume(Number(volumeInput.value) / 100)
 })
 
+function keyUnder(x, y) {
+  const el = document.elementFromPoint(x, y)
+  const key = el?.closest?.(".key")
+  return key && keysEl.contains(key) ? key : null
+}
+
+keysEl.addEventListener("touchstart", (event) => {
+  for (const touch of event.changedTouches) {
+    const key = keyUnder(touch.clientX, touch.clientY)
+    if (key) pressKey(key.dataset.note, touch.identifier)
+  }
+  event.preventDefault()
+}, { passive: false })
+
+keysEl.addEventListener("touchmove", (event) => {
+  event.preventDefault()
+  for (const touch of event.touches) {
+    const key = keyUnder(touch.clientX, touch.clientY)
+    const next = key?.dataset.note || null
+    const current = held.get(touch.identifier)?.note || null
+    if (next === current) continue
+    if (next) pressKey(next, touch.identifier)
+    else releaseKey(touch.identifier)
+  }
+}, { passive: false })
+
+keysEl.addEventListener("touchend", (event) => {
+  event.preventDefault()
+  for (const touch of event.changedTouches) releaseKey(touch.identifier)
+}, { passive: false })
+
+keysEl.addEventListener("touchcancel", (event) => {
+  for (const touch of event.changedTouches) releaseKey(touch.identifier)
+})
+
 keysEl.addEventListener("pointerdown", (event) => {
+  if (event.pointerType === "touch") return
   const key = event.target.closest(".key")
   if (!key) return
+  event.preventDefault()
   pressKey(key.dataset.note, event.pointerId)
   try { key.setPointerCapture?.(event.pointerId) } catch { /* the note already started */ }
 })
 
-keysEl.addEventListener("pointerup", (event) => releaseKey(event.pointerId))
+keysEl.addEventListener("pointerup", (event) => {
+  if (event.pointerType === "touch") return
+  releaseKey(event.pointerId)
+})
 keysEl.addEventListener("pointercancel", (event) => releaseKey(event.pointerId))
 keysEl.addEventListener("contextmenu", (event) => event.preventDefault())
+keysEl.addEventListener("selectstart", (event) => event.preventDefault())
+
+document.addEventListener("selectstart", (event) => {
+  if (event.target.closest("input, textarea")) return
+  event.preventDefault()
+})
 
 spread.addEventListener("click", (event) => {
   const chip = event.target.closest("[data-action]")
