@@ -39,6 +39,7 @@ const state = {
   sleeping: false,
   playing: false,
   activeId: null,
+  samplesReady: false,
 }
 
 const presses = { pennant: 0, ball: 0, charge: 0 }
@@ -81,6 +82,10 @@ audio.setHooks({
   onBeat: () => {
     beatEl.classList.add("flash")
     setTimeout(() => beatEl.classList.remove("flash"), 90)
+  },
+  onKeysReady: () => {
+    state.samplesReady = true
+    paintStatus()
   },
 })
 
@@ -377,6 +382,10 @@ function paintDeck() {
 
 function paintStatus() {
   const active = PAGES.find((page) => page.id === state.activeId)
+  if (!state.samplesReady && !state.playing) {
+    nowEl.textContent = "Loading the keyboard…"
+    return
+  }
   if (state.playing && active?.tune) {
     nowEl.textContent = `Playing · ${active.tune}`
     return

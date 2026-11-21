@@ -1,11 +1,55 @@
-const PITCH = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }
+const SEMI = { C: 0, Cs: 1, D: 2, Ds: 3, E: 4, F: 5, Fs: 6, G: 7, A: 9, As: 10, B: 11 }
 const VOICES = ["piano", "trumpet", "guitar", "flute", "saxophone", "drums"]
 
+// Recorded notes. Piano, trumpet, flute, and sax are Versilian (CC BY 3.0).
+// Guitar is the University of Iowa set shared as CC BY 3.0. Drums are FluidR3 (CC BY 3.0).
+const LIBRARY = {
+  piano: ["C4", "Cs4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"],
+  guitar: ["C4", "Cs4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"],
+  saxophone: ["C4", "Cs4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"],
+  trumpet: ["C4", "Ds4", "F4", "G4", "As4", "D5"],
+  flute: ["C4", "E4", "A4", "C5"],
+  drums: ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"],
+}
+
+const PEAK = { piano: 0.9, guitar: 0.82, trumpet: 0.6, flute: 0.55, saxophone: 0.58, drums: 0.9 }
+const OFFSET = { flute: 0.22 }
+
+const cache = {}
+const gate = {}
+for (const inst of Object.keys(LIBRARY)) {
+  cache[inst] = {}
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  gate[inst] = { promise, resolve, done: false }
+}
+
+function finishGate(inst) {
+  if (gate[inst].done) return
+  gate[inst].done = true
+  gate[inst].resolve()
+}
+
+const fetched = Promise.all(Object.entries(LIBRARY).flatMap(([inst, notes]) => notes.map(async (note) => {
+  try {
+    const response = await fetch(`samples/${inst}/${note}.mp3`)
+    if (!response.ok) throw new Error(String(response.status))
+    return { inst, note, buf: await response.arrayBuffer() }
+  } catch {
+    return null
+  }
+})))
+
 export function noteFreq(note) {
-  const match = /^([A-G])(\d)$/.exec(note || "")
-  if (!match) return null
-  const midi = (Number(match[2]) + 1) * 12 + PITCH[match[1]]
+  const midi = midiOf(note)
+  if (midi == null) return null
   return 440 * 2 ** ((midi - 69) / 12)
+}
+
+function midiOf(note) {
+  const match = /^([A-G])(s)?(\d)$/.exec(note || "")
+  if (!match) return null
+  return (Number(match[3]) + 1) * 12 + SEMI[match[1] + (match[2] || "")]
 }
 
 export function createEngine() {
@@ -23,6 +67,8 @@ export function createEngine() {
   let melodyPlaying = false
   let rhythmOn = false
   let volume = 0.75
+  let keysReady = false
+  let decodePromise = null
 
   const hooks = {
     getBpm: () => 110,
@@ -33,10 +79,12 @@ export function createEngine() {
     onMelodyDone: () => {},
     onHalted: () => {},
     onBeat: () => {},
+    onKeysReady: () => {},
   }
 
   function setHooks(next) {
     Object.assign(hooks, next)
+    if (keysReady) hooks.onKeysReady()
   }
 
   function ensure() {
@@ -46,16 +94,16 @@ export function createEngine() {
     master = ctx.createGain()
     master.gain.value = volume
     const comp = ctx.createDynamicsCompressor()
-    comp.threshold.value = -16
-    comp.knee.value = 16
-    comp.ratio.value = 8
-    comp.attack.value = 0.004
+    comp.threshold.value = -12
+    comp.knee.value = 8
+    comp.ratio.value = 2.2
+    comp.attack.value = 0.008
     comp.release.value = 0.18
     melodyBus = ctx.createGain()
     rhythmBus = ctx.createGain()
     sfxBus = ctx.createGain()
     melodyBus.gain.value = 0.95
-    rhythmBus.gain.value = 0.5
+    rhythmBus.gain.value = 0.42
     sfxBus.gain.value = 0.7
     melodyBus.connect(master)
     rhythmBus.connect(master)
@@ -64,9 +112,44 @@ export function createEngine() {
     comp.connect(ctx.destination)
   }
 
+  function markKeysReady() {
+    if (keysReady || !gate.piano.done || !gate.guitar.done) return
+    keysReady = true
+    hooks.onKeysReady()
+  }
+
+  function decodeAll() {
+    if (decodePromise) return decodePromise
+    ensure()
+    decodePromise = (async () => {
+      const items = await fetched
+      const order = ["piano", "guitar", "trumpet", "flute", "saxophone", "drums"]
+      for (const inst of order) {
+        await Promise.all(items.filter((item) => item && item.inst === inst).map(async (item) => {
+          if (cache[inst][item.note]) return
+          try {
+            cache[inst][item.note] = await ctx.decodeAudioData(item.buf.slice(0))
+          } catch { /* skip a bad file; the nearest note covers it */ }
+        }))
+        finishGate(inst)
+        markKeysReady()
+      }
+    })().catch(() => {
+      for (const inst of Object.keys(LIBRARY)) finishGate(inst)
+      markKeysReady()
+    })
+    return decodePromise
+  }
+
   function unlock() {
     ensure()
     if (ctx.state !== "running") ctx.resume()
+    decodeAll()
+  }
+
+  function whenReady(inst) {
+    decodeAll()
+    return gate[inst]?.promise || Promise.resolve()
   }
 
   function setVolume(value) {
@@ -83,6 +166,7 @@ export function createEngine() {
   function killBus(bus) {
     for (const node of [...live]) {
       if (node.__bus !== bus) continue
+      try { node.__cut?.() } catch { /* already silent */ }
       try { node.stop?.() } catch { /* already stopped */ }
       try { node.disconnect?.() } catch { /* already gone */ }
       live.delete(node)
@@ -95,6 +179,126 @@ export function createEngine() {
     return melodyBus
   }
 
+  function nearest(inst, note) {
+    const bank = cache[inst]
+    const target = midiOf(note)
+    if (!bank || target == null) return null
+    let best = null
+    let bestDist = 99
+    for (const name of Object.keys(bank)) {
+      const dist = Math.abs(midiOf(name) - target)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = name
+      }
+    }
+    if (!best || bestDist > 4) return null
+    return { buffer: bank[best], rate: 2 ** ((target - midiOf(best)) / 12) }
+  }
+
+  function spawn(inst, note, time, busName) {
+    const hit = nearest(inst, note)
+    if (!hit) return null
+    const src = tag(ctx.createBufferSource(), busName)
+    const gain = tag(ctx.createGain(), busName)
+    src.buffer = hit.buffer
+    src.playbackRate.setValueAtTime(hit.rate, time)
+    const offset = Math.min(OFFSET[inst] || 0, Math.max(0, hit.buffer.duration - 0.35))
+    const peak = PEAK[inst] || 0.7
+    if (offset > 0) {
+      gain.gain.setValueAtTime(0.0001, time)
+      gain.gain.exponentialRampToValueAtTime(peak, time + 0.03)
+    } else {
+      gain.gain.setValueAtTime(peak, time)
+    }
+    src.connect(gain)
+    gain.connect(busOf(busName))
+    src.start(time, offset)
+    src.onended = () => {
+      live.delete(src)
+      live.delete(gain)
+      try { src.disconnect() } catch { /* already gone */ }
+      try { gain.disconnect() } catch { /* already gone */ }
+    }
+    src.__cut = () => {
+      const at = ctx.currentTime
+      try {
+        gain.gain.cancelScheduledValues(at)
+        gain.gain.setValueAtTime(0.0001, at)
+      } catch { /* gain already closed */ }
+    }
+    return { src, gain, peak }
+  }
+
+  function scheduleFade(voice, time, length, release) {
+    const end = time + Math.max(0.05, length)
+    const from = Math.max(time + 0.031, end)
+    voice.gain.gain.setValueAtTime(voice.peak, from)
+    voice.gain.gain.exponentialRampToValueAtTime(0.0001, from + release)
+    try { voice.src.stop(from + release + 0.03) } catch { /* already stopped */ }
+  }
+
+  function playSample(inst, note, time, length, busName) {
+    const voice = spawn(inst, note, time, busName)
+    if (!voice) {
+      fallback(noteFreq(note), time, length, busName)
+      return
+    }
+    const release = inst === "guitar" ? 0.34 : inst === "piano" ? 0.16 : inst === "drums" ? 0.1 : 0.08
+    const min = inst === "guitar" ? 0.28 : 0.06
+    scheduleFade(voice, time, Math.max(min, length), release)
+  }
+
+  function holdSample(inst, note, busName) {
+    const now = ctx.currentTime
+    const voice = spawn(inst, note, now, busName)
+    if (!voice) {
+      fallback(noteFreq(note), now, 0.35, busName)
+      return { release() {} }
+    }
+    const plucked = inst === "guitar" || inst === "drums"
+    if (plucked) {
+      scheduleFade(voice, now, inst === "guitar" ? 1.7 : 0.34, inst === "guitar" ? 0.4 : 0.12)
+      return { release() {} }
+    }
+    let released = false
+    return {
+      release() {
+        if (released) return
+        released = true
+        const at = ctx.currentTime
+        const fade = inst === "piano" ? 0.08 : 0.1
+        try {
+          voice.gain.gain.cancelScheduledValues(at)
+          voice.gain.gain.setValueAtTime(Math.max(0.0001, voice.gain.gain.value), at)
+          voice.gain.gain.exponentialRampToValueAtTime(0.0001, at + fade)
+          voice.src.stop(at + fade + 0.02)
+        } catch { /* already ended */ }
+      },
+    }
+  }
+
+  function fallback(freq, time, dur, busName) {
+    if (!freq) return
+    const osc = tag(ctx.createOscillator(), busName)
+    osc.type = "triangle"
+    osc.frequency.setValueAtTime(freq, time)
+    const gain = tag(ctx.createGain(), busName)
+    gain.gain.setValueAtTime(0.0001, time)
+    gain.gain.exponentialRampToValueAtTime(0.1, time + 0.012)
+    gain.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(0.18, dur))
+    osc.connect(gain)
+    gain.connect(busOf(busName))
+    osc.start(time)
+    osc.stop(time + Math.max(0.2, dur) + 0.02)
+  }
+
+  function voice(instrument, note, time, dur, busName) {
+    const id = instrument === "surprise" ? VOICES[(Math.random() * VOICES.length) | 0] : instrument
+    const length = id === "guitar" ? Math.max(dur, 0.36) : id === "piano" ? Math.max(dur * 0.9, 0.1) : dur
+    playSample(id, note, time, length, busName)
+  }
+
   function env(busName, time, peak, attack, release) {
     const gain = tag(ctx.createGain(), busName)
     gain.gain.setValueAtTime(0.0001, time)
@@ -102,127 +306,6 @@ export function createEngine() {
     gain.gain.exponentialRampToValueAtTime(0.0001, time + attack + release)
     gain.connect(busOf(busName))
     return gain
-  }
-
-  function piano(freq, time, dur, busName) {
-    const partials = [1, 2, 3, 4, 6]
-    const amps = [0.2, 0.09, 0.045, 0.02, 0.01]
-    const release = Math.max(0.18, Math.min(0.85, dur * 1.15))
-    partials.forEach((harmonic, index) => {
-      const osc = tag(ctx.createOscillator(), busName)
-      osc.type = "sine"
-      osc.frequency.setValueAtTime(freq * harmonic, time)
-      const gain = env(busName, time, amps[index], 0.008, release / (1 + index * 0.35))
-      osc.connect(gain)
-      osc.start(time)
-      osc.stop(time + release + 0.1)
-    })
-  }
-
-  function brass(freq, time, dur, busName, bright) {
-    const osc = tag(ctx.createOscillator(), busName)
-    osc.type = bright ? "sawtooth" : "square"
-    osc.frequency.setValueAtTime(freq * 0.97, time)
-    osc.frequency.exponentialRampToValueAtTime(freq, time + 0.07)
-    const filter = tag(ctx.createBiquadFilter(), busName)
-    filter.type = "lowpass"
-    filter.Q.value = bright ? 5 : 7
-    const open = Math.min(bright ? 2800 : 2200, freq * (bright ? 7 : 5))
-    filter.frequency.setValueAtTime(420, time)
-    filter.frequency.exponentialRampToValueAtTime(open, time + 0.09)
-    filter.frequency.exponentialRampToValueAtTime(Math.max(300, freq * 2), time + Math.max(dur, 0.2))
-    const gain = env(busName, time, bright ? 0.16 : 0.14, 0.03, Math.max(0.16, dur * 0.9))
-    osc.connect(filter)
-    filter.connect(gain)
-    osc.start(time)
-    osc.stop(time + dur + 0.3)
-  }
-
-  function guitar(freq, time, dur, busName) {
-    const delay = tag(ctx.createDelay(1), busName)
-    delay.delayTime.setValueAtTime(1 / freq, time)
-    const damp = tag(ctx.createBiquadFilter(), busName)
-    damp.type = "lowpass"
-    damp.frequency.value = 2400
-    const feedback = tag(ctx.createGain(), busName)
-    feedback.gain.setValueAtTime(0.9, time)
-    feedback.gain.exponentialRampToValueAtTime(0.2, time + Math.max(0.28, dur + 0.15))
-    delay.connect(damp)
-    damp.connect(feedback)
-    feedback.connect(delay)
-    const burst = Math.floor(ctx.sampleRate * 0.03)
-    const buffer = ctx.createBuffer(1, burst, ctx.sampleRate)
-    const data = buffer.getChannelData(0)
-    for (let i = 0; i < burst; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / burst)
-    const noise = tag(ctx.createBufferSource(), busName)
-    noise.buffer = buffer
-    noise.connect(delay)
-    const gain = env(busName, time, 0.28, 0.005, Math.max(0.25, dur + 0.2))
-    delay.connect(gain)
-    noise.start(time)
-    noise.stop(time + 0.04)
-  }
-
-  function flute(freq, time, dur, busName) {
-    const osc = tag(ctx.createOscillator(), busName)
-    osc.type = "sine"
-    osc.frequency.setValueAtTime(freq, time)
-    if (dur > 0.28) {
-      const lfo = tag(ctx.createOscillator(), busName)
-      const depth = tag(ctx.createGain(), busName)
-      lfo.frequency.value = 5
-      depth.gain.value = freq * 0.012
-      lfo.connect(depth)
-      depth.connect(osc.frequency)
-      lfo.start(time)
-      lfo.stop(time + dur + 0.2)
-    }
-    const air = tag(ctx.createBufferSource(), busName)
-    air.buffer = noiseBuffer(Math.min(1, dur + 0.1))
-    const airFilter = tag(ctx.createBiquadFilter(), busName)
-    airFilter.type = "bandpass"
-    airFilter.frequency.value = freq * 2
-    airFilter.Q.value = 0.7
-    const airGain = env(busName, time, 0.03, 0.05, Math.max(0.2, dur))
-    air.connect(airFilter)
-    airFilter.connect(airGain)
-    air.start(time)
-    air.stop(time + dur + 0.05)
-    const gain = env(busName, time, 0.2, Math.min(0.08, dur * 0.4), Math.max(0.15, dur * 0.85))
-    osc.connect(gain)
-    osc.start(time)
-    osc.stop(time + dur + 0.2)
-  }
-
-  function drums(freq, time, dur, busName) {
-    const osc = tag(ctx.createOscillator(), busName)
-    osc.type = "sine"
-    osc.frequency.setValueAtTime(freq * 1.6, time)
-    osc.frequency.exponentialRampToValueAtTime(Math.max(50, freq * 0.85), time + 0.09)
-    const gain = env(busName, time, 0.34, 0.004, Math.max(0.14, dur * 0.55))
-    osc.connect(gain)
-    osc.start(time)
-    osc.stop(time + dur + 0.2)
-    const snap = tag(ctx.createBufferSource(), busName)
-    snap.buffer = noiseBuffer(0.05)
-    const snapFilter = tag(ctx.createBiquadFilter(), busName)
-    snapFilter.type = "highpass"
-    snapFilter.frequency.value = 900
-    const snapGain = env(busName, time, 0.12, 0.002, 0.06)
-    snap.connect(snapFilter)
-    snapFilter.connect(snapGain)
-    snap.start(time)
-    snap.stop(time + 0.05)
-  }
-
-  function voice(instrument, freq, time, dur, busName) {
-    const id = instrument === "surprise" ? VOICES[(Math.random() * VOICES.length) | 0] : instrument
-    if (id === "piano") piano(freq, time, dur, busName)
-    else if (id === "trumpet") brass(freq, time, dur, busName, true)
-    else if (id === "guitar") guitar(freq, time, dur, busName)
-    else if (id === "flute") flute(freq, time, dur, busName)
-    else if (id === "saxophone") brass(freq, time, dur, busName, false)
-    else drums(freq, time, dur, busName)
   }
 
   function noiseBuffer(seconds) {
@@ -416,14 +499,7 @@ export function createEngine() {
     hooks.onHighlight(-1)
   }
 
-  function playMelody(events) {
-    unlock()
-    stopMelody()
-    if (!events?.length) {
-      hooks.onMelodyDone()
-      return
-    }
-    const token = melodyToken
+  function runMelody(events, token) {
     melodyPlaying = true
     hooks.onStart()
     let cursor = 0
@@ -453,10 +529,7 @@ export function createEngine() {
         const event = events[cursor]
         const beats = event.beats > 0 ? event.beats : 0.25
         const dur = beats * (60 / Math.max(48, hooks.getBpm()))
-        if (event.note) {
-          const freq = noteFreq(event.note)
-          if (freq) voice(hooks.getInstrument(), freq, next, Math.max(0.08, dur * 0.92), "melody")
-        }
+        if (event.note) voice(hooks.getInstrument(), event.note, next, Math.max(0.08, dur * 0.92), "melody")
         if (event.sfx) playSfx(event.sfx, next, "melody")
         else if (hooks.getSilly() && event.note && cursor % 5 === 4) {
           const names = ["clap", "boing", "whistle", "sparkle"]
@@ -489,45 +562,36 @@ export function createEngine() {
     highlightRaf = requestAnimationFrame(watch)
   }
 
+  function playMelody(events) {
+    unlock()
+    stopMelody()
+    if (!events?.length) {
+      hooks.onMelodyDone()
+      return
+    }
+    const token = melodyToken
+    const inst = hooks.getInstrument()
+    const wait = inst === "surprise" ? decodeAll() : whenReady(inst)
+    wait.then(() => {
+      if (token !== melodyToken) return
+      runMelody(events, token)
+    })
+  }
+
   function startNote(note, instrument) {
     unlock()
-    const freq = noteFreq(note)
-    if (!freq) return () => {}
-    const now = ctx.currentTime
     const id = instrument === "surprise" ? VOICES[(Math.random() * VOICES.length) | 0] : instrument
-    if (id !== "flute" && id !== "saxophone" && id !== "trumpet") {
-      voice(id, freq, now, id === "piano" ? 0.55 : 0.38, "keys")
-      return () => {}
-    }
-    const gain = tag(ctx.createGain(), "keys")
-    gain.gain.setValueAtTime(0.0001, now)
-    gain.gain.exponentialRampToValueAtTime(id === "flute" ? 0.2 : 0.15, now + 0.04)
-    gain.connect(melodyBus)
-    const osc = tag(ctx.createOscillator(), "keys")
-    osc.type = id === "flute" ? "sine" : "sawtooth"
-    osc.frequency.setValueAtTime(freq, now)
-    let filter = null
-    if (id !== "flute") {
-      filter = tag(ctx.createBiquadFilter(), "keys")
-      filter.type = "lowpass"
-      filter.frequency.setValueAtTime(id === "trumpet" ? 2200 : 1400, now)
-      osc.connect(filter)
-      filter.connect(gain)
-    } else {
-      osc.connect(gain)
-    }
-    osc.start(now)
     let released = false
+    let handle = null
+    const begin = () => {
+      if (released) return
+      handle = holdSample(id, note, "keys")
+    }
+    if (nearest(id, note)) begin()
+    else whenReady(id).then(begin)
     return () => {
-      if (released || !ctx) return
       released = true
-      const at = ctx.currentTime
-      try {
-        gain.gain.cancelScheduledValues(at)
-        gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), at)
-        gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.12)
-        osc.stop(at + 0.14)
-      } catch { /* stopped already */ }
+      handle?.release()
     }
   }
 
@@ -538,6 +602,8 @@ export function createEngine() {
     killBus("sfx")
     hooks.onHalted()
   }
+
+  decodeAll()
 
   return {
     setHooks,
