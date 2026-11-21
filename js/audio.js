@@ -14,6 +14,12 @@ const LIBRARY = {
 
 const PEAK = { piano: 0.9, guitar: 0.82, trumpet: 0.6, flute: 0.55, saxophone: 0.58, drums: 0.9 }
 const OFFSET = { flute: 0.22 }
+const pageStart = performance.now() / 1000
+
+function isIOSDevice() {
+  const ua = navigator.userAgent || ""
+  return /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+}
 
 const cache = {}
 const gate = {}
@@ -84,6 +90,9 @@ export function createEngine() {
   let decodePromise = null
   let primed = false
   let unlocked = false
+  const ios = isIOSDevice()
+  const htmlLive = new Set()
+  const htmlPool = []
 
   const hooks = {
     getBpm: () => 110,
@@ -193,7 +202,124 @@ export function createEngine() {
     return decodePromise
   }
 
+  function clock() {
+    if (!ios && ctx) return ctx.currentTime
+    return performance.now() / 1000 - pageStart
+  }
+
+  function sampleFile(inst, note) {
+    const names = LIBRARY[inst] || LIBRARY.piano
+    const target = midiOf(note)
+    let best = names[0]
+    let bestDist = 99
+    for (const name of names) {
+      const dist = Math.abs(midiOf(name) - target)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = name
+      }
+    }
+    return { url: `samples/${inst}/${best}.mp3`, rate: 2 ** ((target - midiOf(best)) / 12) }
+  }
+
+  function takePlayer() {
+    const free = htmlPool.find((el) => el.paused || el.dataset.priming === "1")
+    if (free) {
+      delete free.dataset.priming
+      return free
+    }
+    const el = document.createElement("audio")
+    el.setAttribute("playsinline", "")
+    el.setAttribute("webkit-playsinline", "")
+    el.preload = "auto"
+    el.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none"
+    document.body.appendChild(el)
+    htmlPool.push(el)
+    return el
+  }
+
+  function primePlayers() {
+    if (primed) return
+    primed = true
+    for (let i = 0; i < 6; i++) takePlayer()
+    for (const el of htmlPool) {
+      el.src = "samples/piano/C4.mp3"
+      el.volume = 0.01
+      el.dataset.priming = "1"
+      const pending = el.play()
+      if (pending && pending.then) {
+        pending.then(() => {
+          if (el.dataset.priming !== "1") return
+          el.pause()
+          try { el.currentTime = 0 } catch { /* not seekable yet */ }
+        }).catch(() => {})
+      }
+    }
+    if (!keysReady) {
+      keysReady = true
+      hooks.onKeysReady()
+    }
+  }
+
+  function htmlLevel(inst) {
+    return Math.max(0, Math.min(1, (PEAK[inst] || 0.8) * volume))
+  }
+
+  function startHtml(inst, note, length, busName) {
+    const picked = sampleFile(inst, note)
+    const el = takePlayer()
+    if (!el.src.endsWith(`/${inst}/${picked.url.split("/").pop()}`)) el.src = picked.url
+    try { el.preservesPitch = false } catch { /* older Safari */ }
+    try { el.webkitPreservesPitch = false } catch { /* older Safari */ }
+    el.playbackRate = picked.rate
+    el.volume = htmlLevel(inst)
+    try { el.currentTime = inst === "flute" ? 0.22 : 0 } catch { /* seek after play */ }
+    const handle = {
+      bus: busName,
+      el,
+      stop() {
+        htmlLive.delete(handle)
+        clearTimeout(handle.timer)
+        el.pause()
+      },
+    }
+    htmlLive.add(handle)
+    const pending = el.play()
+    if (pending && pending.catch) pending.catch(() => {})
+    if (length > 0) handle.timer = setTimeout(() => handle.stop(), length * 1000)
+    return handle
+  }
+
+  function playHtml(inst, note, time, length, busName) {
+    const delay = Math.max(0, (time - clock()) * 1000)
+    let inner = null
+    let timer = 0
+    const handle = {
+      bus: busName,
+      stop() {
+        htmlLive.delete(handle)
+        clearTimeout(timer)
+        inner?.stop()
+      },
+    }
+    htmlLive.add(handle)
+    const begin = () => {
+      inner = startHtml(inst, note, length, busName)
+    }
+    if (delay < 30) begin()
+    else timer = setTimeout(begin, delay)
+    return handle
+  }
+
   function unlock() {
+    if (ios) {
+      primePlayers()
+      if (!unlocked) {
+        unlocked = true
+        try { hooks.onUnlock() } catch { /* status line can update later */ }
+      }
+      return
+    }
     ensure()
     if (ctx.state !== "running") {
       const pending = ctx.resume()
@@ -221,7 +347,8 @@ export function createEngine() {
 
   function setVolume(value) {
     volume = Math.min(1, Math.max(0, value))
-    if (master) master.gain.setTargetAtTime(volume, ctx.currentTime, 0.02)
+    if (master && ctx) master.gain.setTargetAtTime(volume, ctx.currentTime, 0.02)
+    for (const handle of htmlLive) handle.el.volume = Math.max(0, Math.min(1, handle.el.volume))
   }
 
   function tag(node, bus) {
@@ -231,6 +358,9 @@ export function createEngine() {
   }
 
   function killBus(bus) {
+    for (const handle of [...htmlLive]) {
+      if (handle.bus === bus) handle.stop()
+    }
     for (const node of [...live]) {
       if (node.__bus !== bus) continue
       try { node.__cut?.() } catch { /* already silent */ }
@@ -310,6 +440,10 @@ export function createEngine() {
   }
 
   function playSample(inst, note, time, length, busName) {
+    if (ios) {
+      playHtml(inst, note, time, length + (inst === "guitar" ? 0.34 : 0.16), busName)
+      return
+    }
     const voice = spawn(inst, note, time, busName)
     if (!voice) {
       fallback(noteFreq(note), time, length, busName)
@@ -321,6 +455,12 @@ export function createEngine() {
   }
 
   function holdSample(inst, note, busName) {
+    if (ios) {
+      const plucked = inst === "guitar" || inst === "drums"
+      const handle = startHtml(inst, note, plucked ? (inst === "guitar" ? 2.1 : 0.5) : 0, busName)
+      if (plucked) return { release() {} }
+      return { release() { handle.stop() } }
+    }
     const now = ctx.currentTime
     const voice = spawn(inst, note, now, busName)
     if (!voice) {
@@ -446,6 +586,7 @@ export function createEngine() {
 
   function playSfx(id, time = null, busName = "sfx") {
     unlock()
+    if (ios) return
     const when = time ?? ctx.currentTime
     if (id === "clap") playClap(when, busName)
     else if (id === "boing") playBoing(when, busName)
@@ -540,16 +681,17 @@ export function createEngine() {
     rhythmOn = true
     const rows = LOOPS[id]
     let step = 0
-    let next = ctx.currentTime + 0.05
+    let next = clock() + 0.05
     const tick = () => {
       if (token !== rhythmToken) return
-      if (next < ctx.currentTime - 0.05) next = ctx.currentTime
+      const at = clock()
+      if (next < at - 0.05) next = at
       let guard = 0
-      while (next < ctx.currentTime + 0.16 && guard < 8) {
+      while (next < at + 0.16 && guard < 8) {
         const bpm = Math.max(48, hooks.getBpm())
         const stepDur = 60 / bpm / 4
         for (const row of rows) {
-          if (row.steps[step]) drumHit(row.drum, next)
+          if (row.steps[step] && !ios) drumHit(row.drum, next)
         }
         if (step % 4 === 0) hooks.onBeat()
         step = (step + 1) % 16
@@ -574,12 +716,12 @@ export function createEngine() {
     melodyPlaying = true
     hooks.onStart()
     let cursor = 0
-    let next = ctx.currentTime + 0.05
+    let next = clock() + 0.02
     const timeline = []
 
     const watch = () => {
       if (token !== melodyToken || !melodyPlaying) return
-      const now = ctx.currentTime
+      const now = clock()
       let lit = -1
       for (let i = timeline.length - 1; i >= 0; i--) {
         const item = timeline[i]
@@ -594,9 +736,10 @@ export function createEngine() {
 
     const tick = () => {
       if (token !== melodyToken) return
-      if (next < ctx.currentTime - 0.05) next = ctx.currentTime
+      const at = clock()
+      if (next < at - 0.05) next = at
       let guard = 0
-      while (cursor < events.length && next < ctx.currentTime + 0.2 && guard < 16) {
+      while (cursor < events.length && next < at + 0.2 && guard < 16) {
         const event = events[cursor]
         const beats = event.beats > 0 ? event.beats : 0.25
         const dur = beats * (60 / Math.max(48, hooks.getBpm()))
@@ -616,7 +759,7 @@ export function createEngine() {
         guard += 1
       }
       if (cursor >= events.length) {
-        const wait = Math.max(30, (next - ctx.currentTime) * 1000 + 40)
+        const wait = Math.max(30, (next - clock()) * 1000 + 40)
         melodyTimer = setTimeout(() => {
           if (token !== melodyToken) return
           melodyPlaying = false
@@ -641,6 +784,10 @@ export function createEngine() {
       return
     }
     const token = melodyToken
+    if (ios) {
+      runMelody(events, token)
+      return
+    }
     const inst = hooks.getInstrument()
     const wait = inst === "surprise" ? decodeAll() : whenReady(inst)
     wait.then(() => {
@@ -652,6 +799,13 @@ export function createEngine() {
   function startNote(note, instrument) {
     unlock()
     const id = instrument === "surprise" ? VOICES[(Math.random() * VOICES.length) | 0] : instrument
+    if (ios) {
+      const plucked = id === "guitar" || id === "drums"
+      const handle = startHtml(id, note, plucked ? (id === "guitar" ? 2.1 : 0.5) : 0, "keys")
+      return () => {
+        if (!plucked) handle.stop()
+      }
+    }
     let released = false
     let handle = null
     const begin = () => {

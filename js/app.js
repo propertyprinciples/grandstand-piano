@@ -1,4 +1,4 @@
-import { createEngine } from "./audio.js"
+import { createEngine } from "./audio.js?v=6"
 import {
   EFFECTS,
   INSTRUMENTS,
@@ -594,9 +594,8 @@ volumeInput.addEventListener("input", () => {
 keysEl.addEventListener("pointerdown", (event) => {
   const key = event.target.closest(".key")
   if (!key) return
-  event.preventDefault()
-  key.setPointerCapture?.(event.pointerId)
   pressKey(key.dataset.note, event.pointerId)
+  try { key.setPointerCapture?.(event.pointerId) } catch { /* the note already started */ }
 })
 
 keysEl.addEventListener("pointerup", (event) => releaseKey(event.pointerId))

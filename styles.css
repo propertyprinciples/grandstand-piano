@@ -628,6 +628,7 @@ input[type="range"]::-moz-range-thumb {
   gap: 2px;
   padding-bottom: 8px;
   user-select: none;
+  touch-action: none;
 }
 
 .key b,
